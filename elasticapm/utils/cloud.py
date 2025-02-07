@@ -33,6 +33,7 @@ import os
 import socket
 
 import urllib3
+from urllib3.util.retry import Retry
 
 
 def aws_metadata():
@@ -40,48 +41,60 @@ def aws_metadata():
     Fetch AWS metadata from the local metadata server. If metadata server is
     not found, return an empty dictionary
     """
-    http = urllib3.PoolManager()
+
+    V1_URL = "http://169.254.169.254/latest/meta-data/"
+    V2_TOKEN_URL = "http://169.254.169.254/latest/api/token"
+    TOKEN_HEADERS = {"X-aws-ec2-metadata-token-ttl-seconds": "300"}
+
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[401])
+    http = urllib3.PoolManager(retries=retries)
+
+    def fetch_metadata(path, headers=None):
+        url = f"{V1_URL}{path}"
+        response = http.request("GET", url, headers=headers, timeout=1.0, retries=False)
+        data = response.data.decode("utf-8")
+        return data
 
     try:
-        # This will throw an error if the metadata server isn't available,
-        # and will be quiet in the logs, unlike urllib3
         with socket.create_connection(("169.254.169.254", 80), 0.1):
             pass
 
+        metadata = {}
         try:
-            # This whole block is almost unnecessary. IMDSv1 will be supported
-            # indefinitely, so the only time this block is needed is if a
-            # security-conscious user has set the metadata service to require
-            # IMDSv2. Thus, the very expansive try:except: coverage.
-
-            # TODO: should we have a config option to completely disable IMDSv2 to reduce overhead?
-            ttl_header = {"X-aws-ec2-metadata-token-ttl-seconds": "300"}
-            token_url = "http://169.254.169.254/latest/api/token"
-            token_request = http.request("PUT", token_url, headers=ttl_header, timeout=1.0, retries=False)
+            # IMDSv2
+            token_request = http.request("PUT", V2_TOKEN_URL, headers=TOKEN_HEADERS, timeout=1.0)
             token = token_request.data.decode("utf-8")
+
             aws_token_header = {"X-aws-ec2-metadata-token": token} if token else {}
-        except Exception:
-            aws_token_header = {}
-        metadata = json.loads(
-            http.request(
-                "GET",
-                "http://169.254.169.254/latest/dynamic/instance-identity/document",
-                headers=aws_token_header,
-                timeout=1.0,
-                retries=False,
-            ).data.decode("utf-8")
-        )
 
-        return {
-            "account": {"id": metadata["accountId"]},
-            "instance": {"id": metadata["instanceId"]},
-            "availability_zone": metadata["availabilityZone"],
-            "machine": {"type": metadata["instanceType"]},
-            "provider": "aws",
-            "region": metadata["region"],
-        }
+            metadata = json.loads(fetch_metadata("dynamic/instance-identity/document", headers=aws_token_header))
 
-    except Exception:
+            metadata = {
+                "account": {"id": metadata["accountId"]},
+                "instance": {"id": metadata["instanceId"]},
+                "availability_zone": metadata["availabilityZone"],
+                "machine": {"type": metadata["instanceType"]},
+                "provider": "aws",
+                "region": metadata["region"],
+            }
+        except urllib3.exceptions.HTTPError as e:
+            # IMDSv1
+            if e.response.status == 401:
+                account_id = fetch_metadata("iam/info")
+                instance_id = fetch_metadata("instance-id")
+                instance_type = fetch_metadata("instance-type")
+                availability_zone = fetch_metadata("placement/availability-zone")
+
+                metadata = {
+                    "accountId": account_id,
+                    "instanceId": instance_id,
+                    "instanceType": instance_type,
+                    "availabilityZone": availability_zone,
+                    "region": availability_zone[:-1],
+                }
+        return metadata
+
+    except (socket.error, urllib3.exceptions.HTTPError):
         # Not on an AWS box
         return {}
 
